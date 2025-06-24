@@ -2,6 +2,9 @@
 $conn = new mysqli("localhost", "root", "", "faculty_scheduling");
 if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
 
+// Set a time limit for the script to prevent hanging
+set_time_limit(10);
+
 class Schedule {
     public $course_id, $lecturer_id, $room_id, $time_slot_id, $class_label;
     public function __construct($course_id, $lecturer_id, $room_id, $time_slot_id, $class_label) {
@@ -78,6 +81,7 @@ function mutate($population, $rooms, $time_slots) {
 }
 
 function generate_schedule($conn, $semester) {
+    $start_time = microtime(true);
     $courses = $conn->query("SELECT c.id, c.program_id, c.lecturer_id, c.semester_number, 
                                     CASE c.semester_number 
                                         WHEN 1 THEN p.student_count_sem1 
@@ -126,36 +130,31 @@ function generate_schedule($conn, $semester) {
         foreach ($course_class_counts as $course_id => $info) {
             $message .= "{$info['course_name']} ({$info['num_classes']} classes), ";
         }
-        return ["success" => false, "message" => rtrim($message, ", ")];
+        return ["success" => false, "message" => rtrim($message, ", "), "generation" => 0];
     }
 
-    $population_size = 100;
+    $population_size = 150; // Increased for better convergence
     $generations = 200;
-    $mutation_rate = 20;
+    $mutation_rate = 30; // Increased mutation rate
     $population = [];
     foreach ($courses as $course) {
         if (in_array($course['semester_number'], $semester_numbers)) {
-            $num_classes = ceil($course['student_count'] / $reference_capacity);
-            $course_class_counts[$course['id']] = $num_classes;
+            for ($class_num = 0; $class_num < $course_class_counts[$course['id']]['num_classes']; $class_num++) {
+                $class_label = chr(65 + $class_num);
+                $individual[] = new Schedule(
+                    $course['id'],
+                    $course['lecturer_id'],
+                    $rooms[array_rand($rooms)]['id'],
+                    $time_slots[array_rand($time_slots)]['id'],
+                    $class_label
+                );
+            }
         }
     }
     for ($i = 0; $i < $population_size; $i++) {
-        $individual = [];
-        foreach ($courses as $course) {
-            if (in_array($course['semester_number'], $semester_numbers)) {
-                for ($class_num = 0; $class_num < $course_class_counts[$course['id']]; $class_num++) {
-                    $class_label = chr(65 + $class_num);
-                    $individual[] = new Schedule(
-                        $course['id'],
-                        $course['lecturer_id'],
-                        $rooms[array_rand($rooms)]['id'],
-                        $time_slots[array_rand($time_slots)]['id'],
-                        $class_label
-                    );
-                }
-            }
-        }
-        $population[] = $individual;
+        $population[] = array_map(function($schedule) {
+            return clone $schedule;
+        }, $individual);
     }
 
     $best_fitness = 0;
@@ -194,17 +193,46 @@ function generate_schedule($conn, $semester) {
             $best_fitness = $current_best;
             $best_population = $population[array_search($current_best, $fitness_scores)];
         }
+
+        // Send generation progress to client
+        $execution_time = microtime(true) - $start_time;
+        if ($execution_time > 8) {
+            return [
+                "success" => false,
+                "message" => "Generation timed out after $gen generations (best fitness: $best_fitness). Try adjusting student counts, adding rooms/time slots, or reassigning lecturers.",
+                "generation" => $gen
+            ];
+        }
+
+        // Early exit if perfect schedule found
+        if ($best_fitness == 1000) {
+            break;
+        }
     }
 
     if ($best_fitness < 1000) {
-        $message = "GA could not find a conflict-free schedule (best fitness: $best_fitness). Try: ";
-        $message .= "reassigning lecturers, adding more rooms/time slots, or reducing student counts. ";
-        $message .= "Class counts: ";
-        foreach ($course_class_counts as $course_id => $info) {
-            $course_name = $conn->query("SELECT name FROM courses WHERE id = $course_id")->fetch_assoc()['name'];
-            $message .= "$course_name ($info classes), ";
+        $message = "Could not find a conflict-free schedule after $generations generations (best fitness: $best_fitness). Conflicts: ";
+        $room_usage = [];
+        $lecturer_usage = [];
+        foreach ($best_population as $schedule) {
+            $key = "{$schedule->time_slot_id}-{$schedule->room_id}";
+            $lkey = "{$schedule->time_slot_id}-{$schedule->lecturer_id}";
+            if (isset($room_usage[$key])) {
+                $course_name = $conn->query("SELECT name FROM courses WHERE id = {$schedule->course_id}")->fetch_assoc()['name'];
+                $message .= "Room conflict for $course_name (Class {$schedule->class_label}) at time slot {$schedule->time_slot_id}, ";
+            }
+            if (isset($lecturer_usage[$lkey])) {
+                $course_name = $conn->query("SELECT name FROM courses WHERE id = {$schedule->course_id}")->fetch_assoc()['name'];
+                $message .= "Lecturer conflict for $course_name (Class {$schedule->class_label}) at time slot {$schedule->time_slot_id}, ";
+            }
+            $room_usage[$key] = true;
+            $lecturer_usage[$lkey] = true;
         }
-        return ["success" => false, "message" => rtrim($message, ", ")];
+        $message = rtrim($message, ", ") . ". Class counts: ";
+        foreach ($course_class_counts as $course_id => $info) {
+            $message .= "{$info['course_name']} ({$info['num_classes']} classes), ";
+        }
+        return ["success" => false, "message" => rtrim($message, ", "), "generation" => $generations];
     }
 
     $conn->query("DELETE FROM schedules WHERE semester = '$semester'");
@@ -214,7 +242,7 @@ function generate_schedule($conn, $semester) {
         $stmt->execute();
         $stmt->close();
     }
-    return ["success" => true, "message" => "Schedule generated successfully!"];
+    return ["success" => true, "message" => "Schedule generated successfully!", "generation" => $gen + 1];
 }
 
 if (isset($_POST['generate'])) {
@@ -334,25 +362,27 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
     <script>
         $(document).ready(function() {
             let generationInterval;
-            let xhr; // Store AJAX request
+            let xhr;
 
-            function startGenerationCounter() {
+            function startGenerationCounter(maxGenerations) {
                 let generation = 0;
                 $('#generationCounter').text(generation);
                 generationInterval = setInterval(() => {
                     generation++;
-                    if (generation <= 200) {
+                    if (generation <= maxGenerations) {
                         $('#generationCounter').text(generation);
-                    } else {
-                        clearInterval(generationInterval);
                     }
-                }, 15); // ~3 seconds for 200 generations
+                }, 15);
+            }
+
+            function stopGenerationCounter() {
+                clearInterval(generationInterval);
             }
 
             function stopGeneration() {
-                clearInterval(generationInterval);
+                stopGenerationCounter();
                 if (xhr) {
-                    xhr.abort(); // Cancel AJAX request
+                    xhr.abort();
                 }
                 $('#loadingModal').modal('hide');
                 $('#alertContainer').html(
@@ -365,7 +395,7 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                 $('#loadingModal').modal({ backdrop: 'static', keyboard: false });
                 $('#loadingModal').modal('show');
                 $('#alertContainer').empty();
-                startGenerationCounter();
+                startGenerationCounter(200);
 
                 xhr = $.ajax({
                     url: 'schedule.php',
@@ -373,10 +403,10 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                     data: $(this).serialize() + '&generate=1',
                     dataType: 'json',
                     success: function(response) {
-                        clearInterval(generationInterval);
+                        stopGenerationCounter();
                         $('#loadingModal').modal('hide');
                         $('#alertContainer').html(
-                            `<div class="alert ${response.success ? 'alert-success' : 'alert-danger'}">${response.message}</div>`
+                            `<div class="alert ${response.success ? 'alert-success' : 'alert-danger'}">${response.message} (Generation: ${response.generation})</div>`
                         );
                         if (response.success) {
                             $.ajax({
@@ -394,10 +424,10 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                     },
                     error: function(jqXHR, textStatus) {
                         if (textStatus !== 'abort') {
-                            clearInterval(generationInterval);
+                            stopGenerationCounter();
                             $('#loadingModal').modal('hide');
                             $('#alertContainer').html(
-                                '<div class="alert alert-danger">An error occurred while generating the schedule.</div>'
+                                '<div class="alert alert-danger">An error occurred while generating the schedule. Please try again or check server logs.</div>'
                             );
                         }
                     }
