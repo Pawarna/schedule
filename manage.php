@@ -2,6 +2,9 @@
 $conn = new mysqli("localhost", "root", "", "faculty_scheduling");
 if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
 
+// Initialize error message variable
+$error_message = '';
+
 // Handle Program CRUD
 if (isset($_POST['add_program'])) {
     $name = $_POST['name'];
@@ -34,7 +37,14 @@ if (isset($_POST['edit_program'])) {
 
 if (isset($_GET['delete_program'])) {
     $id = (int)$_GET['delete_program'];
-    $conn->query("DELETE FROM programs WHERE id = $id");
+    // Check for dependent courses
+    $check = $conn->query("SELECT COUNT(*) as count FROM courses WHERE program_id = $id");
+    $row = $check->fetch_assoc();
+    if ($row['count'] > 0) {
+        $error_message = "Cannot delete program because it has associated courses. Please delete the courses first.";
+    } else {
+        $conn->query("DELETE FROM programs WHERE id = $id");
+    }
 }
 
 // Handle Lecturer CRUD
@@ -202,6 +212,11 @@ $time_slots = $conn->query("SELECT * FROM time_slots");
             <!-- Programs Tab -->
             <div class="tab-pane fade show active" id="programs" role="tabpanel">
                 <h3 class="mt-4">Programs</h3>
+                <?php if ($error_message): ?>
+                    <div class="alert alert-danger" role="alert">
+                        <?php echo $error_message; ?>
+                    </div>
+                <?php endif; ?>
                 <form method="POST" class="mb-4">
                     <div class="row">
                         <div class="col-md-3">
@@ -255,7 +270,7 @@ $time_slots = $conn->query("SELECT * FROM time_slots");
                                 <td><?php echo $row['student_count_sem6']; ?></td>
                                 <td>
                                     <button class="btn btn-sm btn-warning" data-bs-toggle="modal" data-bs-target="#editProgramModal<?php echo $row['id']; ?>">Edit</button>
-                                    <a href="?delete_program=<?php echo $row['id']; ?>" class="btn btn-sm btn-danger" onclick="return confirm('Are you sure?');">Delete</a>
+                                    <a href="?delete_program=<?php echo $row['id']; ?>" class="btn btn-sm btn-danger" onclick="return confirm('Are you sure you want to delete this program?');">Delete</a>
                                 </td>
                             </tr>
                             <!-- Edit Program Modal -->

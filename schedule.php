@@ -2,8 +2,8 @@
 $conn = new mysqli("localhost", "root", "", "faculty_scheduling");
 if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
 
-// Set a time limit for the script to prevent hanging
-set_time_limit(10);
+// Set a time limit for the script
+set_time_limit(20);
 
 class Schedule {
     public $course_id, $lecturer_id, $room_id, $time_slot_id, $class_label;
@@ -16,10 +16,11 @@ class Schedule {
     }
 }
 
-function get_fitness($population, $conn, $semester) {
+function get_fitness($population, $conn, $semester, $course_class_counts) {
     $conflicts = 0;
     $room_usage = [];
     $lecturer_usage = [];
+    $capacity_issues = [];
     foreach ($population as $schedule) {
         $key = "{$schedule->time_slot_id}-{$schedule->room_id}";
         $lkey = "{$schedule->time_slot_id}-{$schedule->lecturer_id}";
@@ -36,15 +37,18 @@ function get_fitness($population, $conn, $semester) {
                                            WHEN 4 THEN p.student_count_sem4 
                                            WHEN 5 THEN p.student_count_sem5 
                                            WHEN 6 THEN p.student_count_sem6 
-                                       END AS student_count
+                                       END AS student_count,
+                                       c.name as course_name
                                 FROM rooms r 
                                 JOIN courses c ON c.id = {$schedule->course_id}
                                 JOIN programs p ON c.program_id = p.id 
                                 WHERE r.id = {$schedule->room_id} AND c.semester = '$semester'");
         if ($result && $data = $result->fetch_assoc()) {
-            $students_per_class = ceil($data['student_count'] / max(1, ceil($data['student_count'] / 50)));
+            $num_classes = $course_class_counts[$schedule->course_id]['num_classes'];
+            $students_per_class = ceil($data['student_count'] / $num_classes);
             if ($students_per_class > $data['capacity']) {
-                $conflicts += 2;
+                $conflicts += 0.5; // Further reduced penalty
+                $capacity_issues[] = "{$data['course_name']} (Class {$schedule->class_label}, ~{$students_per_class} students, needs >{$data['capacity']} capacity)";
             }
         }
 
@@ -55,7 +59,10 @@ function get_fitness($population, $conn, $semester) {
             }
         }
     }
-    return $conflicts == 0 ? 1000 : 1000 / (1 + $conflicts);
+    return [
+        'fitness' => $conflicts == 0 ? 1000 : 1000 / (1 + $conflicts),
+        'capacity_issues' => $capacity_issues
+    ];
 }
 
 function crossover($parent1, $parent2) {
@@ -90,28 +97,44 @@ function generate_schedule($conn, $semester) {
                                         WHEN 4 THEN p.student_count_sem4 
                                         WHEN 5 THEN p.student_count_sem5 
                                         WHEN 6 THEN p.student_count_sem6 
-                                    END AS student_count
+                                    END AS student_count,
+                                    c.name as course_name
                              FROM courses c 
                              JOIN programs p ON c.program_id = p.id 
                              WHERE c.semester = '$semester'")->fetch_all(MYSQLI_ASSOC);
     $rooms = $conn->query("SELECT id, capacity FROM rooms")->fetch_all(MYSQLI_ASSOC);
     $time_slots = $conn->query("SELECT id FROM time_slots")->fetch_all(MYSQLI_ASSOC);
 
+    // Get min and max room capacity
+    $min_room_capacity = min(array_column($rooms, 'capacity'));
+    $max_room_capacity = max(array_column($rooms, 'capacity'));
+
     $total_classes = 0;
     $lecturer_load = [];
     $course_class_counts = [];
-    $reference_capacity = 50;
     $semester_numbers = $semester == 'odd' ? [1, 3, 5] : [2, 4, 6];
     foreach ($courses as $course) {
         if (in_array($course['semester_number'], $semester_numbers)) {
-            $num_classes = ceil($course['student_count'] / $reference_capacity);
-            $course_class_counts[$course['id']] = ['num_classes' => $num_classes, 'lecturer_id' => $course['lecturer_id'], 'course_name' => $conn->query("SELECT name FROM courses WHERE id = {$course['id']}")->fetch_assoc()['name']];
+            // Ensure students_per_class fits within min_room_capacity
+            $num_classes = max(1, ceil($course['student_count'] / $min_room_capacity));
+            $students_per_class = ceil($course['student_count'] / $num_classes);
+            // Adjust if still too large for max_room_capacity
+            while ($students_per_class > $max_room_capacity && $num_classes < 10) {
+                $num_classes++;
+                $students_per_class = ceil($course['student_count'] / $num_classes);
+            }
+            $course_class_counts[$course['id']] = [
+                'num_classes' => $num_classes,
+                'lecturer_id' => $course['lecturer_id'],
+                'course_name' => $course['course_name'],
+                'student_count' => $course['student_count'],
+                'students_per_class' => $students_per_class
+            ];
             $total_classes += $num_classes;
             $lecturer_load[$course['lecturer_id']] = ($lecturer_load[$course['lecturer_id']] ?? 0) + $num_classes;
         }
     }
     $available_slots = count($rooms) * count($time_slots);
-    $max_lecturer_load = max($lecturer_load);
     $overloaded_lecturers = [];
     foreach ($lecturer_load as $lecturer_id => $load) {
         if ($load > count($time_slots)) {
@@ -119,28 +142,37 @@ function generate_schedule($conn, $semester) {
             $overloaded_lecturers[] = "$lecturer_name ($load classes)";
         }
     }
-    if (empty($courses) || empty($rooms) || empty($time_slots) || !empty($overloaded_lecturers) || $available_slots < $total_classes) {
-        $message = "Insufficient resources: ";
-        if (empty($courses)) $message .= "No courses found. ";
-        if (empty($rooms)) $message .= "No rooms found. ";
-        if (empty($time_slots)) $message .= "No time slots found. ";
-        if (!empty($overloaded_lecturers)) $message .= "Overloaded lecturers: " . implode(", ", $overloaded_lecturers) . ". Max " . count($time_slots) . " slots available per lecturer. ";
-        if ($available_slots < $total_classes) $message .= "Need more rooms/time slots ($total_classes classes, $available_slots slots available). ";
-        $message .= "Class counts per course: ";
+    $capacity_issues = [];
+    foreach ($course_class_counts as $course_id => $info) {
+        if ($info['students_per_class'] > $max_room_capacity) {
+            $capacity_issues[] = "{$info['course_name']} ({$info['student_count']} students, needs >$max_room_capacity capacity)";
+        }
+    }
+    if (empty($courses) || empty($rooms) || empty($time_slots) || !empty($overloaded_lecturers) || $available_slots < $total_classes || !empty($capacity_issues)) {
+        $message = "Sumber daya tidak cukup: ";
+        if (empty($courses)) $message .= "Tidak ada mata kuliah. ";
+        if (empty($rooms)) $message .= "Tidak ada ruangan. ";
+        if (empty($time_slots)) $message .= "Tidak ada slot waktu. ";
+        if (!empty($overloaded_lecturers)) $message .= "Dosen kelebihan beban: " . implode(", ", $overloaded_lecturers) . ". Maksimal " . count($time_slots) . " slot per dosen. ";
+        if ($available_slots < $total_classes) $message .= "Butuh lebih banyak ruangan/slot waktu ($total_classes kelas, $available_slots slot tersedia). ";
+        if (!empty($capacity_issues)) $message .= "Masalah kapasitas: " . implode("; ", $capacity_issues) . ". ";
+        $message .= "Jumlah kelas per mata kuliah: ";
         foreach ($course_class_counts as $course_id => $info) {
-            $message .= "{$info['course_name']} ({$info['num_classes']} classes), ";
+            $message .= "{$info['course_name']} ({$info['num_classes']} kelas, ~{$info['students_per_class']} siswa per kelas), ";
         }
         return ["success" => false, "message" => rtrim($message, ", "), "generation" => 0];
     }
 
-    $population_size = 150; // Increased for better convergence
-    $generations = 200;
-    $mutation_rate = 30; // Increased mutation rate
+    $population_size = 150;
+    $generations = 500; // Increased for better convergence
+    $mutation_rate = 30;
     $population = [];
+    $individual = [];
     foreach ($courses as $course) {
         if (in_array($course['semester_number'], $semester_numbers)) {
-            for ($class_num = 0; $class_num < $course_class_counts[$course['id']]['num_classes']; $class_num++) {
-                $class_label = chr(65 + $class_num);
+            $num_classes = $course_class_counts[$course['id']]['num_classes'];
+            for ($class_num = 0; $class_num < $num_classes; $class_num++) {
+                $class_label = chr(65 + $class_num); // A, B, C, etc.
                 $individual[] = new Schedule(
                     $course['id'],
                     $course['lecturer_id'],
@@ -159,10 +191,15 @@ function generate_schedule($conn, $semester) {
 
     $best_fitness = 0;
     $best_population = $population[0];
+    $best_capacity_issues = [];
     for ($gen = 0; $gen < $generations; $gen++) {
-        $fitness_scores = array_map(function($pop) use ($conn, $semester) {
-            return get_fitness($pop, $conn, $semester);
+        $fitness_results = array_map(function($pop) use ($conn, $semester, $course_class_counts) {
+            return get_fitness($pop, $conn, $semester, $course_class_counts);
         }, $population);
+
+        $fitness_scores = array_map(function($result) {
+            return $result['fitness'];
+        }, $fitness_results);
 
         $parents = [];
         $temp_scores = $fitness_scores;
@@ -188,30 +225,39 @@ function generate_schedule($conn, $semester) {
 
         $population = array_merge($new_population, array_slice($parents, 0, $population_size - count($new_population)));
 
-        $current_best = max($fitness_scores);
-        if ($current_best > $best_fitness) {
-            $best_fitness = $current_best;
-            $best_population = $population[array_search($current_best, $fitness_scores)];
+        $current_best_idx = array_search(max($fitness_scores), $fitness_scores);
+        $current_best_fitness = $fitness_scores[$current_best_idx];
+        if ($current_best_fitness > $best_fitness) {
+            $best_fitness = $current_best_fitness;
+            $best_population = $population[$current_best_idx];
+            $best_capacity_issues = $fitness_results[$current_best_idx]['capacity_issues'];
         }
 
-        // Send generation progress to client
         $execution_time = microtime(true) - $start_time;
-        if ($execution_time > 8) {
+        if ($execution_time > 18) { // Adjusted for increased generations
+            $message = "Generasi timeout setelah $gen generasi (fitness terbaik: $best_fitness). ";
+            if (!empty($best_capacity_issues)) {
+                $message .= "Masalah kapasitas: " . implode("; ", $best_capacity_issues) . ". ";
+            }
+            $message .= "Jumlah kelas: ";
+            foreach ($course_class_counts as $course_id => $info) {
+                $message .= "{$info['course_name']} ({$info['num_classes']} kelas, ~{$info['students_per_class']} siswa per kelas), ";
+            }
+            $message .= "Coba tambah kapasitas ruangan (>50), tambah ruangan/slot waktu, atau kurangi jumlah siswa.";
             return [
                 "success" => false,
-                "message" => "Generation timed out after $gen generations (best fitness: $best_fitness). Try adjusting student counts, adding rooms/time slots, or reassigning lecturers.",
+                "message" => $message,
                 "generation" => $gen
             ];
         }
 
-        // Early exit if perfect schedule found
         if ($best_fitness == 1000) {
             break;
         }
     }
 
     if ($best_fitness < 1000) {
-        $message = "Could not find a conflict-free schedule after $generations generations (best fitness: $best_fitness). Conflicts: ";
+        $message = "Gagal menemukan jadwal tanpa konflik setelah $generations generasi (fitness terbaik: $best_fitness). Konflik: ";
         $room_usage = [];
         $lecturer_usage = [];
         foreach ($best_population as $schedule) {
@@ -219,18 +265,21 @@ function generate_schedule($conn, $semester) {
             $lkey = "{$schedule->time_slot_id}-{$schedule->lecturer_id}";
             if (isset($room_usage[$key])) {
                 $course_name = $conn->query("SELECT name FROM courses WHERE id = {$schedule->course_id}")->fetch_assoc()['name'];
-                $message .= "Room conflict for $course_name (Class {$schedule->class_label}) at time slot {$schedule->time_slot_id}, ";
+                $message .= "Konflik ruangan untuk $course_name (Class {$schedule->class_label}) pada slot waktu {$schedule->time_slot_id}, ";
             }
             if (isset($lecturer_usage[$lkey])) {
                 $course_name = $conn->query("SELECT name FROM courses WHERE id = {$schedule->course_id}")->fetch_assoc()['name'];
-                $message .= "Lecturer conflict for $course_name (Class {$schedule->class_label}) at time slot {$schedule->time_slot_id}, ";
+                $message .= "Konflik dosen untuk $course_name (Class {$schedule->class_label}) pada slot waktu {$schedule->time_slot_id}, ";
             }
             $room_usage[$key] = true;
             $lecturer_usage[$lkey] = true;
         }
-        $message = rtrim($message, ", ") . ". Class counts: ";
+        if (!empty($best_capacity_issues)) {
+            $message .= "Masalah kapasitas: " . implode("; ", $best_capacity_issues) . ". ";
+        }
+        $message .= "Jumlah kelas: ";
         foreach ($course_class_counts as $course_id => $info) {
-            $message .= "{$info['course_name']} ({$info['num_classes']} classes), ";
+            $message .= "{$info['course_name']} ({$info['num_classes']} kelas, ~{$info['students_per_class']} siswa per kelas), ";
         }
         return ["success" => false, "message" => rtrim($message, ", "), "generation" => $generations];
     }
@@ -242,7 +291,11 @@ function generate_schedule($conn, $semester) {
         $stmt->execute();
         $stmt->close();
     }
-    return ["success" => true, "message" => "Schedule generated successfully!", "generation" => $gen + 1];
+    $message = "Jadwal berhasil dibuat! Jumlah kelas: ";
+    foreach ($course_class_counts as $course_id => $info) {
+        $message .= "{$info['course_name']} ({$info['num_classes']} kelas, ~{$info['students_per_class']} siswa per kelas), ";
+    }
+    return ["success" => true, "message" => rtrim($message, ", "), "generation" => $gen + 1];
 }
 
 if (isset($_POST['generate'])) {
@@ -351,7 +404,7 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                 <div class="modal-body">
                     <div class="spinner-border text-primary" role="status"></div>
                     <h5>Generating Schedule...</h5>
-                    <p>Generation: <span id="generationCounter">0</span>/200</p>
+                    <p>Generation: <span id="generationCounter">0</span>/500</p>
                     <button id="cancelGeneration" class="btn btn-danger mt-2">Cancel</button>
                 </div>
             </div>
@@ -386,7 +439,7 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                 }
                 $('#loadingModal').modal('hide');
                 $('#alertContainer').html(
-                    '<div class="alert alert-warning">Schedule generation cancelled.</div>'
+                    '<div class="alert alert-warning">Pembuatan jadwal dibatalkan.</div>'
                 );
             }
 
@@ -395,7 +448,7 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                 $('#loadingModal').modal({ backdrop: 'static', keyboard: false });
                 $('#loadingModal').modal('show');
                 $('#alertContainer').empty();
-                startGenerationCounter(200);
+                startGenerationCounter(500);
 
                 xhr = $.ajax({
                     url: 'schedule.php',
@@ -406,7 +459,7 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                         stopGenerationCounter();
                         $('#loadingModal').modal('hide');
                         $('#alertContainer').html(
-                            `<div class="alert ${response.success ? 'alert-success' : 'alert-danger'}">${response.message} (Generation: ${response.generation})</div>`
+                            `<div class="alert ${response.success ? 'alert-success' : 'alert-danger'}">${response.message} (Generasi: ${response.generation})</div>`
                         );
                         if (response.success) {
                             $.ajax({
@@ -427,7 +480,7 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                             stopGenerationCounter();
                             $('#loadingModal').modal('hide');
                             $('#alertContainer').html(
-                                '<div class="alert alert-danger">An error occurred while generating the schedule. Please try again or check server logs.</div>'
+                                '<div class="alert alert-danger">Terjadi kesalahan saat membuat jadwal. Coba lagi atau cek log server.</div>'
                             );
                         }
                     }
