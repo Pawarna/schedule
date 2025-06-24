@@ -2,8 +2,6 @@
 $conn = new mysqli("localhost", "root", "", "faculty_scheduling");
 if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
 
-// Set a time limit for the script
-set_time_limit(20);
 
 class Schedule {
     public $course_id, $lecturer_id, $room_id, $time_slot_id, $class_label;
@@ -164,7 +162,7 @@ function generate_schedule($conn, $semester) {
     }
 
     $population_size = 150;
-    $generations = 500; // Increased for better convergence
+    $generations = 1000; // Increased for better convergence
     $mutation_rate = 30;
     $population = [];
     $individual = [];
