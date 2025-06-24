@@ -1,6 +1,20 @@
 <?php
+session_start();
 $conn = new mysqli("localhost", "root", "", "faculty_scheduling");
 if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
+
+// Check if admin is logged in
+if (!isset($_SESSION['admin_id'])) {
+    header("Location: login.php");
+    exit;
+}
+
+// Handle logout
+if (isset($_POST['logout'])) {
+    session_destroy();
+    header("Location: login.php");
+    exit;
+}
 
 class Schedule {
     public $course_id, $lecturer_id, $room_id, $time_slot_id, $class_label;
@@ -102,7 +116,6 @@ function generate_schedule($conn, $semester) {
     $rooms = $conn->query("SELECT id, capacity FROM rooms")->fetch_all(MYSQLI_ASSOC);
     $time_slots = $conn->query("SELECT id, day FROM time_slots")->fetch_all(MYSQLI_ASSOC);
 
-    // Validate day values
     $valid_days = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
     foreach ($time_slots as $slot) {
         if (!in_array($slot['day'], $valid_days)) {
@@ -281,12 +294,10 @@ if (isset($_POST['generate'])) {
     exit;
 }
 
-// Get list of programs for tabs
 $programs = $conn->query("SELECT id, name FROM programs")->fetch_all(MYSQLI_ASSOC);
 $semester_filter = isset($_POST['semester']) ? $_POST['semester'] : 'odd';
 $program_filter = isset($_POST['program_id']) ? $_POST['program_id'] : 'all';
 
-// Define day order explicitly
 $day_order = "FIELD(t.day, 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu')";
 $query = "SELECT s.*, c.name as course_name, c.semester_number, l.name as lecturer_name, r.name as room_name, t.day, t.start_time, t.end_time, p.name as program_name
           FROM schedules s 
@@ -340,9 +351,23 @@ $result = $conn->query($query);
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item">
+                        <a class="nav-link" href="manage.php">Manage Entities</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link active" href="schedule.php">Generate Schedule</a>
+                    </li>
+                </ul>
                 <ul class="navbar-nav">
-                    <li class="nav-item"><a class="nav-link" href="manage.php">Manage Entities</a></li>
-                    <li class="nav-item"><a class="nav-link active" href="schedule.php">Generate Schedule</a></li>
+                    <li class="nav-item">
+                        <span class="nav-link">Welcome, <?php echo htmlspecialchars($_SESSION['admin_username']); ?></span>
+                    </li>
+                    <li class="nav-item">
+                        <form method="POST" style="display: inline;">
+                            <button type="submit" name="logout" class="nav-link btn btn-link">Logout</button>
+                        </form>
+                    </li>
                 </ul>
             </div>
         </div>
@@ -509,7 +534,7 @@ $result = $conn->query($query);
                 stopGeneration();
             });
 
-            $('.nav-link').on('click', function(e) {
+            $('.nav-link[data-program]').on('click', function(e) {
                 e.preventDefault();
                 $('.nav-link').removeClass('active');
                 $(this).addClass('active');
@@ -525,6 +550,10 @@ $result = $conn->query($query);
                         $('#scheduleTable').html(newTable);
                     }
                 });
+            });
+
+            $('.navbar-nav .nav-link:not([data-program])').on('click', function(e) {
+                console.log('Nav link clicked: ' + $(this).attr('href'));
             });
         });
     </script>

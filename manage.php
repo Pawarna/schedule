@@ -1,7 +1,18 @@
 <?php
+session_start();
 $conn = new mysqli("localhost", "root", "", "faculty_scheduling");
 if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
 
+if (!isset($_SESSION['admin_id'])) {
+    header("Location: login.php");
+    exit;
+}
+
+if (isset($_POST['logout'])) {
+    session_destroy();
+    header("Location: login.php");
+    exit;
+}
 // Initialize error message variable
 $error_message = '';
 
@@ -182,9 +193,23 @@ $time_slots = $conn->query("SELECT * FROM time_slots");
                 <span class="navbar-toggler-icon"></span>
             </button>
             <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav me-auto">
+                    <li class="nav-item">
+                        <a class="nav-link active" href="manage.php">Manage Entities</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="schedule.php">Generate Schedule</a>
+                    </li>
+                </ul>
                 <ul class="navbar-nav">
-                    <li class="nav-item"><a class="nav-link active" href="manage.php">Manage Entities</a></li>
-                    <li class="nav-item"><a class="nav-link" href="schedule.php">Generate Schedule</a></li>
+                    <li class="nav-item">
+                        <span class="nav-link">Welcome, <?php echo htmlspecialchars($_SESSION['admin_username']); ?></span>
+                    </li>
+                    <li class="nav-item">
+                        <form method="POST" style="display: inline;">
+                            <button type="submit" name="logout" class="nav-link btn btn-link">Logout</button>
+                        </form>
+                    </li>
                 </ul>
             </div>
         </div>
@@ -678,6 +703,7 @@ $time_slots = $conn->query("SELECT * FROM time_slots");
             </div>
         </div>
     </div>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
 </body>
 </html>
