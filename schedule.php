@@ -2,7 +2,6 @@
 $conn = new mysqli("localhost", "root", "", "faculty_scheduling");
 if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
 
-
 class Schedule {
     public $course_id, $lecturer_id, $room_id, $time_slot_id, $class_label;
     public function __construct($course_id, $lecturer_id, $room_id, $time_slot_id, $class_label) {
@@ -45,8 +44,8 @@ function get_fitness($population, $conn, $semester, $course_class_counts) {
             $num_classes = $course_class_counts[$schedule->course_id]['num_classes'];
             $students_per_class = ceil($data['student_count'] / $num_classes);
             if ($students_per_class > $data['capacity']) {
-                $conflicts += 0.5; // Further reduced penalty
-                $capacity_issues[] = "{$data['course_name']} (Class {$schedule->class_label}, ~{$students_per_class} students, needs >{$data['capacity']} capacity)";
+                $conflicts += 0.5;
+                $capacity_issues[] = "{$data['course_name']} (Class {$schedule->class_label}, ~{$students_per_class} siswa, butuh >{$data['capacity']} kapasitas)";
             }
         }
 
@@ -101,9 +100,16 @@ function generate_schedule($conn, $semester) {
                              JOIN programs p ON c.program_id = p.id 
                              WHERE c.semester = '$semester'")->fetch_all(MYSQLI_ASSOC);
     $rooms = $conn->query("SELECT id, capacity FROM rooms")->fetch_all(MYSQLI_ASSOC);
-    $time_slots = $conn->query("SELECT id FROM time_slots")->fetch_all(MYSQLI_ASSOC);
+    $time_slots = $conn->query("SELECT id, day FROM time_slots")->fetch_all(MYSQLI_ASSOC);
 
-    // Get min and max room capacity
+    // Validate day values
+    $valid_days = ['Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu'];
+    foreach ($time_slots as $slot) {
+        if (!in_array($slot['day'], $valid_days)) {
+            error_log("Invalid day in time_slots: " . $slot['day']);
+        }
+    }
+
     $min_room_capacity = min(array_column($rooms, 'capacity'));
     $max_room_capacity = max(array_column($rooms, 'capacity'));
 
@@ -113,10 +119,8 @@ function generate_schedule($conn, $semester) {
     $semester_numbers = $semester == 'odd' ? [1, 3, 5] : [2, 4, 6];
     foreach ($courses as $course) {
         if (in_array($course['semester_number'], $semester_numbers)) {
-            // Ensure students_per_class fits within min_room_capacity
             $num_classes = max(1, ceil($course['student_count'] / $min_room_capacity));
             $students_per_class = ceil($course['student_count'] / $num_classes);
-            // Adjust if still too large for max_room_capacity
             while ($students_per_class > $max_room_capacity && $num_classes < 10) {
                 $num_classes++;
                 $students_per_class = ceil($course['student_count'] / $num_classes);
@@ -137,13 +141,13 @@ function generate_schedule($conn, $semester) {
     foreach ($lecturer_load as $lecturer_id => $load) {
         if ($load > count($time_slots)) {
             $lecturer_name = $conn->query("SELECT name FROM lecturers WHERE id = $lecturer_id")->fetch_assoc()['name'];
-            $overloaded_lecturers[] = "$lecturer_name ($load classes)";
+            $overloaded_lecturers[] = "$lecturer_name ($load kelas)";
         }
     }
     $capacity_issues = [];
     foreach ($course_class_counts as $course_id => $info) {
         if ($info['students_per_class'] > $max_room_capacity) {
-            $capacity_issues[] = "{$info['course_name']} ({$info['student_count']} students, needs >$max_room_capacity capacity)";
+            $capacity_issues[] = "{$info['course_name']} ({$info['student_count']} siswa, butuh >$max_room_capacity kapasitas)";
         }
     }
     if (empty($courses) || empty($rooms) || empty($time_slots) || !empty($overloaded_lecturers) || $available_slots < $total_classes || !empty($capacity_issues)) {
@@ -162,7 +166,6 @@ function generate_schedule($conn, $semester) {
     }
 
     $population_size = 150;
-    $generations = 1000; // Increased for better convergence
     $mutation_rate = 30;
     $population = [];
     $individual = [];
@@ -170,7 +173,7 @@ function generate_schedule($conn, $semester) {
         if (in_array($course['semester_number'], $semester_numbers)) {
             $num_classes = $course_class_counts[$course['id']]['num_classes'];
             for ($class_num = 0; $class_num < $num_classes; $class_num++) {
-                $class_label = chr(65 + $class_num); // A, B, C, etc.
+                $class_label = chr(65 + $class_num);
                 $individual[] = new Schedule(
                     $course['id'],
                     $course['lecturer_id'],
@@ -190,7 +193,9 @@ function generate_schedule($conn, $semester) {
     $best_fitness = 0;
     $best_population = $population[0];
     $best_capacity_issues = [];
-    for ($gen = 0; $gen < $generations; $gen++) {
+    $gen = 0;
+    while (true) {
+        $gen++;
         $fitness_results = array_map(function($pop) use ($conn, $semester, $course_class_counts) {
             return get_fitness($pop, $conn, $semester, $course_class_counts);
         }, $population);
@@ -231,9 +236,8 @@ function generate_schedule($conn, $semester) {
             $best_capacity_issues = $fitness_results[$current_best_idx]['capacity_issues'];
         }
 
-        $execution_time = microtime(true) - $start_time;
-        if ($execution_time > 18) { // Adjusted for increased generations
-            $message = "Generasi timeout setelah $gen generasi (fitness terbaik: $best_fitness). ";
+        if ($gen % 100 == 0) {
+            $message = "Masih mencoba membuat jadwal (fitness terbaik: $best_fitness, generasi: $gen). ";
             if (!empty($best_capacity_issues)) {
                 $message .= "Masalah kapasitas: " . implode("; ", $best_capacity_issues) . ". ";
             }
@@ -241,45 +245,19 @@ function generate_schedule($conn, $semester) {
             foreach ($course_class_counts as $course_id => $info) {
                 $message .= "{$info['course_name']} ({$info['num_classes']} kelas, ~{$info['students_per_class']} siswa per kelas), ";
             }
-            $message .= "Coba tambah kapasitas ruangan (>50), tambah ruangan/slot waktu, atau kurangi jumlah siswa.";
-            return [
+            echo json_encode([
                 "success" => false,
-                "message" => $message,
-                "generation" => $gen
-            ];
+                "message" => rtrim($message, ", "),
+                "generation" => $gen,
+                "progress" => true
+            ]);
+            flush();
+            ob_flush();
         }
 
         if ($best_fitness == 1000) {
             break;
         }
-    }
-
-    if ($best_fitness < 1000) {
-        $message = "Gagal menemukan jadwal tanpa konflik setelah $generations generasi (fitness terbaik: $best_fitness). Konflik: ";
-        $room_usage = [];
-        $lecturer_usage = [];
-        foreach ($best_population as $schedule) {
-            $key = "{$schedule->time_slot_id}-{$schedule->room_id}";
-            $lkey = "{$schedule->time_slot_id}-{$schedule->lecturer_id}";
-            if (isset($room_usage[$key])) {
-                $course_name = $conn->query("SELECT name FROM courses WHERE id = {$schedule->course_id}")->fetch_assoc()['name'];
-                $message .= "Konflik ruangan untuk $course_name (Class {$schedule->class_label}) pada slot waktu {$schedule->time_slot_id}, ";
-            }
-            if (isset($lecturer_usage[$lkey])) {
-                $course_name = $conn->query("SELECT name FROM courses WHERE id = {$schedule->course_id}")->fetch_assoc()['name'];
-                $message .= "Konflik dosen untuk $course_name (Class {$schedule->class_label}) pada slot waktu {$schedule->time_slot_id}, ";
-            }
-            $room_usage[$key] = true;
-            $lecturer_usage[$lkey] = true;
-        }
-        if (!empty($best_capacity_issues)) {
-            $message .= "Masalah kapasitas: " . implode("; ", $best_capacity_issues) . ". ";
-        }
-        $message .= "Jumlah kelas: ";
-        foreach ($course_class_counts as $course_id => $info) {
-            $message .= "{$info['course_name']} ({$info['num_classes']} kelas, ~{$info['students_per_class']} siswa per kelas), ";
-        }
-        return ["success" => false, "message" => rtrim($message, ", "), "generation" => $generations];
     }
 
     $conn->query("DELETE FROM schedules WHERE semester = '$semester'");
@@ -293,7 +271,7 @@ function generate_schedule($conn, $semester) {
     foreach ($course_class_counts as $course_id => $info) {
         $message .= "{$info['course_name']} ({$info['num_classes']} kelas, ~{$info['students_per_class']} siswa per kelas), ";
     }
-    return ["success" => true, "message" => rtrim($message, ", "), "generation" => $gen + 1];
+    return ["success" => true, "message" => rtrim($message, ", "), "generation" => $gen];
 }
 
 if (isset($_POST['generate'])) {
@@ -303,14 +281,26 @@ if (isset($_POST['generate'])) {
     exit;
 }
 
+// Get list of programs for tabs
+$programs = $conn->query("SELECT id, name FROM programs")->fetch_all(MYSQLI_ASSOC);
 $semester_filter = isset($_POST['semester']) ? $_POST['semester'] : 'odd';
-$result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.name as lecturer_name, r.name as room_name, t.day, t.start_time, t.end_time 
-                        FROM schedules s 
-                        JOIN courses c ON s.course_id = c.id 
-                        JOIN lecturers l ON s.lecturer_id = l.id 
-                        JOIN rooms r ON s.room_id = r.id 
-                        JOIN time_slots t ON s.time_slot_id = t.id 
-                        WHERE s.semester = '$semester_filter'");
+$program_filter = isset($_POST['program_id']) ? $_POST['program_id'] : 'all';
+
+// Define day order explicitly
+$day_order = "FIELD(t.day, 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu', 'Minggu')";
+$query = "SELECT s.*, c.name as course_name, c.semester_number, l.name as lecturer_name, r.name as room_name, t.day, t.start_time, t.end_time, p.name as program_name
+          FROM schedules s 
+          JOIN courses c ON s.course_id = c.id 
+          JOIN lecturers l ON s.lecturer_id = l.id 
+          JOIN rooms r ON s.room_id = r.id 
+          JOIN time_slots t ON s.time_slot_id = t.id 
+          JOIN programs p ON c.program_id = p.id 
+          WHERE s.semester = '$semester_filter'";
+if ($program_filter !== 'all') {
+    $query .= " AND c.program_id = " . intval($program_filter);
+}
+$query .= " ORDER BY $day_order, t.start_time";
+$result = $conn->query($query);
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -332,6 +322,13 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
             width: 3rem;
             height: 3rem;
             margin-bottom: 1rem;
+        }
+        .nav-tabs .nav-link {
+            color: #333;
+        }
+        .nav-tabs .nav-link.active {
+            font-weight: bold;
+            background-color: #e9ecef;
         }
     </style>
 </head>
@@ -357,33 +354,45 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
             <div class="row">
                 <div class="col-md-4">
                     <select name="semester" id="semester" class="form-control" required>
-                        <option value="odd" <?php if ($semester_filter == 'odd') echo 'selected'; ?>>Odd Semester</option>
-                        <option value="even" <?php if ($semester_filter == 'even') echo 'selected'; ?>>Even Semester</option>
+                        <option value="odd" <?php if ($semester_filter == 'odd') echo 'selected'; ?>>Semester Ganjil</option>
+                        <option value="even" <?php if ($semester_filter == 'even') echo 'selected'; ?>>Semester Genap</option>
                     </select>
                 </div>
                 <div class="col-md-2">
-                    <button type="submit" name="generate" class="btn btn-success">Generate Schedule</button>
+                    <button type="submit" name="generate" class="btn btn-success">Generate Jadwal</button>
                 </div>
                 <div class="col-md-2">
-                    <a href="export.php?semester=<?php echo $semester_filter; ?>" class="btn btn-primary">Export to Excel</a>
+                    <a href="export.php?semester=<?php echo $semester_filter; ?>&program_id=<?php echo $program_filter; ?>" class="btn btn-primary">Export ke Excel</a>
                 </div>
             </div>
         </form>
+        <ul class="nav nav-tabs mb-4">
+            <li class="nav-item">
+                <a class="nav-link <?php if ($program_filter == 'all') echo 'active'; ?>" href="#" data-program="all">Semua Prodi</a>
+            </li>
+            <?php foreach ($programs as $program): ?>
+                <li class="nav-item">
+                    <a class="nav-link <?php if ($program_filter == $program['id']) echo 'active'; ?>" href="#" data-program="<?php echo $program['id']; ?>"><?php echo $program['name']; ?></a>
+                </li>
+            <?php endforeach; ?>
+        </ul>
         <table class="table table-bordered">
             <thead>
                 <tr>
-                    <th>Course</th>
-                    <th>Semester Number</th>
-                    <th>Class</th>
-                    <th>Lecturer</th>
-                    <th>Room</th>
-                    <th>Day</th>
-                    <th>Time</th>
+                    <th>Program Studi</th>
+                    <th>Mata Kuliah</th>
+                    <th>Semester</th>
+                    <th>Kelas</th>
+                    <th>Dosen</th>
+                    <th>Ruangan</th>
+                    <th>Hari</th>
+                    <th>Waktu</th>
                 </tr>
             </thead>
             <tbody id="scheduleTable">
                 <?php while ($row = $result->fetch_assoc()): ?>
                     <tr>
+                        <td><?php echo $row['program_name']; ?></td>
                         <td><?php echo $row['course_name']; ?></td>
                         <td><?php echo $row['semester_number']; ?></td>
                         <td><?php echo $row['class_label']; ?></td>
@@ -401,9 +410,9 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
             <div class="modal-content">
                 <div class="modal-body">
                     <div class="spinner-border text-primary" role="status"></div>
-                    <h5>Generating Schedule...</h5>
-                    <p>Generation: <span id="generationCounter">0</span>/500</p>
-                    <button id="cancelGeneration" class="btn btn-danger mt-2">Cancel</button>
+                    <h5>Membuat Jadwal...</h5>
+                    <p>Generasi: <span id="generationCounter">0</span></p>
+                    <button id="cancelGeneration" class="btn btn-danger mt-2">Batalkan</button>
                 </div>
             </div>
         </div>
@@ -415,14 +424,12 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
             let generationInterval;
             let xhr;
 
-            function startGenerationCounter(maxGenerations) {
+            function startGenerationCounter() {
                 let generation = 0;
                 $('#generationCounter').text(generation);
                 generationInterval = setInterval(() => {
                     generation++;
-                    if (generation <= maxGenerations) {
-                        $('#generationCounter').text(generation);
-                    }
+                    $('#generationCounter').text(generation);
                 }, 15);
             }
 
@@ -441,38 +448,42 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                 );
             }
 
-            $('#generateForm').on('submit', function(e) {
-                e.preventDefault();
-                $('#loadingModal').modal({ backdrop: 'static', keyboard: false });
-                $('#loadingModal').modal('show');
-                $('#alertContainer').empty();
-                startGenerationCounter(500);
+            function updateProgress(response) {
+                if (response.progress) {
+                    $('#generationCounter').text(response.generation);
+                    $('#alertContainer').html(
+                        `<div class="alert alert-info">${response.message} (Generasi: ${response.generation})</div>`
+                    );
+                    setTimeout(checkProgress, 1000);
+                } else {
+                    stopGenerationCounter();
+                    $('#loadingModal').modal('hide');
+                    $('#alertContainer').html(
+                        `<div class="alert ${response.success ? 'alert-success' : 'alert-danger'}">${response.message} (Generasi: ${response.generation})</div>`
+                    );
+                    if (response.success) {
+                        $.ajax({
+                            url: 'schedule.php',
+                            type: 'POST',
+                            data: { semester: $('#semester').val(), program_id: $('.nav-link.active').data('program') },
+                            success: function(html) {
+                                const parser = new DOMParser();
+                                const doc = parser.parseFromString(html, 'text/html');
+                                const newTable = $(doc).find('#scheduleTable').html();
+                                $('#scheduleTable').html(newTable);
+                            }
+                        });
+                    }
+                }
+            }
 
+            function checkProgress() {
                 xhr = $.ajax({
                     url: 'schedule.php',
                     type: 'POST',
-                    data: $(this).serialize() + '&generate=1',
+                    data: $('#generateForm').serialize() + '&generate=1',
                     dataType: 'json',
-                    success: function(response) {
-                        stopGenerationCounter();
-                        $('#loadingModal').modal('hide');
-                        $('#alertContainer').html(
-                            `<div class="alert ${response.success ? 'alert-success' : 'alert-danger'}">${response.message} (Generasi: ${response.generation})</div>`
-                        );
-                        if (response.success) {
-                            $.ajax({
-                                url: 'schedule.php',
-                                type: 'POST',
-                                data: { semester: $('#semester').val() },
-                                success: function(html) {
-                                    const parser = new DOMParser();
-                                    const doc = parser.parseFromString(html, 'text/html');
-                                    const newTable = $(doc).find('#scheduleTable').html();
-                                    $('#scheduleTable').html(newTable);
-                                }
-                            });
-                        }
-                    },
+                    success: updateProgress,
                     error: function(jqXHR, textStatus) {
                         if (textStatus !== 'abort') {
                             stopGenerationCounter();
@@ -483,10 +494,37 @@ $result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.
                         }
                     }
                 });
+            }
+
+            $('#generateForm').on('submit', function(e) {
+                e.preventDefault();
+                $('#loadingModal').modal({ backdrop: 'static', keyboard: false });
+                $('#loadingModal').modal('show');
+                $('#alertContainer').empty();
+                startGenerationCounter();
+                checkProgress();
             });
 
             $('#cancelGeneration').on('click', function() {
                 stopGeneration();
+            });
+
+            $('.nav-link').on('click', function(e) {
+                e.preventDefault();
+                $('.nav-link').removeClass('active');
+                $(this).addClass('active');
+                const programId = $(this).data('program');
+                $.ajax({
+                    url: 'schedule.php',
+                    type: 'POST',
+                    data: { semester: $('#semester').val(), program_id: programId },
+                    success: function(html) {
+                        const parser = new DOMParser();
+                        const doc = parser.parseFromString(html, 'text/html');
+                        const newTable = $(doc).find('#scheduleTable').html();
+                        $('#scheduleTable').html(newTable);
+                    }
+                });
             });
         });
     </script>
