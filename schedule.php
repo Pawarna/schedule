@@ -3,12 +3,13 @@ $conn = new mysqli("localhost", "root", "", "faculty_scheduling");
 if ($conn->connect_error) die("Connection failed: " . $conn->connect_error);
 
 class Schedule {
-    public $course_id, $lecturer_id, $room_id, $time_slot_id;
-    public function __construct($course_id, $lecturer_id, $room_id, $time_slot_id) {
+    public $course_id, $lecturer_id, $room_id, $time_slot_id, $class_label;
+    public function __construct($course_id, $lecturer_id, $room_id, $time_slot_id, $class_label) {
         $this->course_id = $course_id;
         $this->lecturer_id = $lecturer_id;
         $this->room_id = $room_id;
         $this->time_slot_id = $time_slot_id;
+        $this->class_label = $class_label;
     }
 }
 
@@ -19,21 +20,35 @@ function get_fitness($population, $conn, $semester) {
     foreach ($population as $schedule) {
         $key = "{$schedule->time_slot_id}-{$schedule->room_id}";
         $lkey = "{$schedule->time_slot_id}-{$schedule->lecturer_id}";
-        if (isset($room_usage[$key]) || isset($lecturer_usage[$lkey])) {
-            $conflicts++;
-        }
+        if (isset($room_usage[$key])) $conflicts++;
+        if (isset($lecturer_usage[$lkey])) $conflicts += 2;
         $room_usage[$key] = true;
         $lecturer_usage[$lkey] = true;
 
-        // Check room capacity
-        $result = $conn->query("SELECT r.capacity, p.student_count 
+        $result = $conn->query("SELECT r.capacity, 
+                                       CASE c.semester_number 
+                                           WHEN 1 THEN p.student_count_sem1 
+                                           WHEN 2 THEN p.student_count_sem2 
+                                           WHEN 3 THEN p.student_count_sem3 
+                                           WHEN 4 THEN p.student_count_sem4 
+                                           WHEN 5 THEN p.student_count_sem5 
+                                           WHEN 6 THEN p.student_count_sem6 
+                                       END AS student_count
                                 FROM rooms r 
                                 JOIN courses c ON c.id = {$schedule->course_id}
                                 JOIN programs p ON c.program_id = p.id 
                                 WHERE r.id = {$schedule->room_id} AND c.semester = '$semester'");
         if ($result && $data = $result->fetch_assoc()) {
-            if ($data['student_count'] > $data['capacity']) {
-                $conflicts++;
+            $students_per_class = ceil($data['student_count'] / max(1, ceil($data['student_count'] / 50)));
+            if ($students_per_class > $data['capacity']) {
+                $conflicts += 2;
+            }
+        }
+
+        $result = $conn->query("SELECT lecturer_id FROM courses WHERE id = {$schedule->course_id}");
+        if ($result && $data = $result->fetch_assoc()) {
+            if ($schedule->lecturer_id != $data['lecturer_id']) {
+                $conflicts += 3;
             }
         }
     }
@@ -53,10 +68,9 @@ function crossover($parent1, $parent2) {
     return $child;
 }
 
-function mutate($population, $lecturers, $rooms, $time_slots) {
+function mutate($population, $rooms, $time_slots) {
     $index = rand(0, count($population) - 1);
     $schedule = $population[$index];
-    $schedule->lecturer_id = $lecturers[array_rand($lecturers)]['id'];
     $schedule->room_id = $rooms[array_rand($rooms)]['id'];
     $schedule->time_slot_id = $time_slots[array_rand($time_slots)]['id'];
     $population[$index] = $schedule;
@@ -64,41 +78,93 @@ function mutate($population, $lecturers, $rooms, $time_slots) {
 }
 
 function generate_schedule($conn, $semester) {
-    // Fetch data
-    $courses = $conn->query("SELECT id FROM courses WHERE semester = '$semester'")->fetch_all(MYSQLI_ASSOC);
-    $lecturers = $conn->query("SELECT id FROM lecturers")->fetch_all(MYSQLI_ASSOC);
-    $rooms = $conn->query("SELECT id FROM rooms")->fetch_all(MYSQLI_ASSOC);
+    $courses = $conn->query("SELECT c.id, c.program_id, c.lecturer_id, c.semester_number, 
+                                    CASE c.semester_number 
+                                        WHEN 1 THEN p.student_count_sem1 
+                                        WHEN 2 THEN p.student_count_sem2 
+                                        WHEN 3 THEN p.student_count_sem3 
+                                        WHEN 4 THEN p.student_count_sem4 
+                                        WHEN 5 THEN p.student_count_sem5 
+                                        WHEN 6 THEN p.student_count_sem6 
+                                    END AS student_count
+                             FROM courses c 
+                             JOIN programs p ON c.program_id = p.id 
+                             WHERE c.semester = '$semester'")->fetch_all(MYSQLI_ASSOC);
+    $rooms = $conn->query("SELECT id, capacity FROM rooms")->fetch_all(MYSQLI_ASSOC);
     $time_slots = $conn->query("SELECT id FROM time_slots")->fetch_all(MYSQLI_ASSOC);
 
-    if (empty($courses) || empty($lecturers) || empty($rooms) || empty($time_slots)) {
-        return false; // Data not sufficient
+    $total_classes = 0;
+    $lecturer_load = [];
+    $course_class_counts = [];
+    $reference_capacity = 50;
+    $semester_numbers = $semester == 'odd' ? [1, 3, 5] : [2, 4, 6];
+    foreach ($courses as $course) {
+        if (in_array($course['semester_number'], $semester_numbers)) {
+            $num_classes = ceil($course['student_count'] / $reference_capacity);
+            $course_class_counts[$course['id']] = ['num_classes' => $num_classes, 'lecturer_id' => $course['lecturer_id'], 'course_name' => $conn->query("SELECT name FROM courses WHERE id = {$course['id']}")->fetch_assoc()['name']];
+            $total_classes += $num_classes;
+            $lecturer_load[$course['lecturer_id']] = ($lecturer_load[$course['lecturer_id']] ?? 0) + $num_classes;
+        }
+    }
+    $available_slots = count($rooms) * count($time_slots);
+    $max_lecturer_load = max($lecturer_load);
+    $overloaded_lecturers = [];
+    foreach ($lecturer_load as $lecturer_id => $load) {
+        if ($load > count($time_slots)) {
+            $lecturer_name = $conn->query("SELECT name FROM lecturers WHERE id = $lecturer_id")->fetch_assoc()['name'];
+            $overloaded_lecturers[] = "$lecturer_name ($load classes)";
+        }
+    }
+    if (empty($courses) || empty($rooms) || empty($time_slots) || !empty($overloaded_lecturers) || $available_slots < $total_classes) {
+        $message = "Insufficient resources: ";
+        if (empty($courses)) $message .= "No courses found. ";
+        if (empty($rooms)) $message .= "No rooms found. ";
+        if (empty($time_slots)) $message .= "No time slots found. ";
+        if (!empty($overloaded_lecturers)) $message .= "Overloaded lecturers: " . implode(", ", $overloaded_lecturers) . ". Max " . count($time_slots) . " slots available per lecturer. ";
+        if ($available_slots < $total_classes) $message .= "Need more rooms/time slots ($total_classes classes, $available_slots slots available). ";
+        $message .= "Class counts per course: ";
+        foreach ($course_class_counts as $course_id => $info) {
+            $message .= "{$info['course_name']} ({$info['num_classes']} classes), ";
+        }
+        return ["success" => false, "message" => rtrim($message, ", ")];
     }
 
-    // Initialize population
-    $population_size = 50;
-    $generations = 100;
+    $population_size = 100;
+    $generations = 200;
+    $mutation_rate = 20;
     $population = [];
+    foreach ($courses as $course) {
+        if (in_array($course['semester_number'], $semester_numbers)) {
+            $num_classes = ceil($course['student_count'] / $reference_capacity);
+            $course_class_counts[$course['id']] = $num_classes;
+        }
+    }
     for ($i = 0; $i < $population_size; $i++) {
         $individual = [];
         foreach ($courses as $course) {
-            $individual[] = new Schedule(
-                $course['id'],
-                $lecturers[array_rand($lecturers)]['id'],
-                $rooms[array_rand($rooms)]['id'],
-                $time_slots[array_rand($time_slots)]['id']
-            );
+            if (in_array($course['semester_number'], $semester_numbers)) {
+                for ($class_num = 0; $class_num < $course_class_counts[$course['id']]; $class_num++) {
+                    $class_label = chr(65 + $class_num);
+                    $individual[] = new Schedule(
+                        $course['id'],
+                        $course['lecturer_id'],
+                        $rooms[array_rand($rooms)]['id'],
+                        $time_slots[array_rand($time_slots)]['id'],
+                        $class_label
+                    );
+                }
+            }
         }
         $population[] = $individual;
     }
 
-    // GA loop
+    $best_fitness = 0;
+    $best_population = $population[0];
     for ($gen = 0; $gen < $generations; $gen++) {
-        // Evaluate fitness
         $fitness_scores = array_map(function($pop) use ($conn, $semester) {
             return get_fitness($pop, $conn, $semester);
         }, $population);
 
-        // Select parents
         $parents = [];
         $temp_scores = $fitness_scores;
         for ($i = 0; $i < $population_size / 2; $i++) {
@@ -107,7 +173,6 @@ function generate_schedule($conn, $semester) {
             unset($temp_scores[$parent_idx]);
         }
 
-        // Crossover and mutation
         $new_population = [];
         for ($i = 0; $i < count($parents) - 1; $i += 2) {
             $child1 = crossover($parents[$i], $parents[$i + 1]);
@@ -116,48 +181,51 @@ function generate_schedule($conn, $semester) {
             $new_population[] = $child2;
         }
 
-        // Mutation
         foreach ($new_population as $i => $pop) {
-            if (rand(0, 100) < 10) { // 10% mutation rate
-                $new_population[$i] = mutate($pop, $lecturers, $rooms, $time_slots);
+            if (rand(0, 100) < $mutation_rate) {
+                $new_population[$i] = mutate($pop, $rooms, $time_slots);
             }
         }
 
         $population = array_merge($new_population, array_slice($parents, 0, $population_size - count($new_population)));
-    }
 
-    // Save best schedule
-    $best_fitness = 0;
-    $best_population = $population[0];
-    foreach ($population as $pop) {
-        $fitness = get_fitness($pop, $conn, $semester);
-        if ($fitness > $best_fitness) {
-            $best_fitness = $fitness;
-            $best_population = $pop;
+        $current_best = max($fitness_scores);
+        if ($current_best > $best_fitness) {
+            $best_fitness = $current_best;
+            $best_population = $population[array_search($current_best, $fitness_scores)];
         }
     }
 
-    // Clear previous schedules
-    $conn->query("DELETE FROM schedules WHERE semester = '$semester'");
+    if ($best_fitness < 1000) {
+        $message = "GA could not find a conflict-free schedule (best fitness: $best_fitness). Try: ";
+        $message .= "reassigning lecturers, adding more rooms/time slots, or reducing student counts. ";
+        $message .= "Class counts: ";
+        foreach ($course_class_counts as $course_id => $info) {
+            $course_name = $conn->query("SELECT name FROM courses WHERE id = $course_id")->fetch_assoc()['name'];
+            $message .= "$course_name ($info classes), ";
+        }
+        return ["success" => false, "message" => rtrim($message, ", ")];
+    }
 
-    // Save to database
+    $conn->query("DELETE FROM schedules WHERE semester = '$semester'");
     foreach ($best_population as $schedule) {
-        $stmt = $conn->prepare("INSERT INTO schedules (course_id, lecturer_id, room_id, time_slot_id, semester) VALUES (?, ?, ?, ?, ?)");
-        $stmt->bind_param("iiiis", $schedule->course_id, $schedule->lecturer_id, $schedule->room_id, $schedule->time_slot_id, $semester);
+        $stmt = $conn->prepare("INSERT INTO schedules (course_id, lecturer_id, room_id, time_slot_id, semester, class_label) VALUES (?, ?, ?, ?, ?, ?)");
+        $stmt->bind_param("iiiiss", $schedule->course_id, $schedule->lecturer_id, $schedule->room_id, $schedule->time_slot_id, $semester, $schedule->class_label);
         $stmt->execute();
         $stmt->close();
     }
-    return true;
+    return ["success" => true, "message" => "Schedule generated successfully!"];
 }
 
 if (isset($_POST['generate'])) {
     $semester = $_POST['semester'];
-    $success = generate_schedule($conn, $semester);
+    $result = generate_schedule($conn, $semester);
+    echo json_encode($result);
+    exit;
 }
 
-// Fetch schedules
 $semester_filter = isset($_POST['semester']) ? $_POST['semester'] : 'odd';
-$result = $conn->query("SELECT s.*, c.name as course_name, l.name as lecturer_name, r.name as room_name, t.day, t.start_time, t.end_time 
+$result = $conn->query("SELECT s.*, c.name as course_name, c.semester_number, l.name as lecturer_name, r.name as room_name, t.day, t.start_time, t.end_time 
                         FROM schedules s 
                         JOIN courses c ON s.course_id = c.id 
                         JOIN lecturers l ON s.lecturer_id = l.id 
@@ -172,6 +240,21 @@ $result = $conn->query("SELECT s.*, c.name as course_name, l.name as lecturer_na
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Generate Schedule</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .modal-content {
+            border-radius: 10px;
+            box-shadow: 0 4px 8px rgba(0, 0, 0, 0.2);
+        }
+        .modal-body {
+            text-align: center;
+            padding: 2rem;
+        }
+        .spinner-border {
+            width: 3rem;
+            height: 3rem;
+            margin-bottom: 1rem;
+        }
+    </style>
 </head>
 <body>
     <nav class="navbar navbar-expand-lg navbar-dark bg-dark">
@@ -190,15 +273,11 @@ $result = $conn->query("SELECT s.*, c.name as course_name, l.name as lecturer_na
     </nav>
     <div class="container mt-4">
         <h2>Generate Schedule</h2>
-        <?php if (isset($_POST['generate']) && !$success): ?>
-            <div class="alert alert-danger">Failed to generate schedule. Ensure all entities (courses, lecturers, rooms, time slots) are populated.</div>
-        <?php elseif (isset($_POST['generate']) && $success): ?>
-            <div class="alert alert-success">Schedule generated successfully!</div>
-        <?php endif; ?>
-        <form method="POST" class="mb-4">
+        <div id="alertContainer"></div>
+        <form id="generateForm" class="mb-4">
             <div class="row">
                 <div class="col-md-4">
-                    <select name="semester" class="form-control" required>
+                    <select name="semester" id="semester" class="form-control" required>
                         <option value="odd" <?php if ($semester_filter == 'odd') echo 'selected'; ?>>Odd Semester</option>
                         <option value="even" <?php if ($semester_filter == 'even') echo 'selected'; ?>>Even Semester</option>
                     </select>
@@ -215,16 +294,20 @@ $result = $conn->query("SELECT s.*, c.name as course_name, l.name as lecturer_na
             <thead>
                 <tr>
                     <th>Course</th>
+                    <th>Semester Number</th>
+                    <th>Class</th>
                     <th>Lecturer</th>
                     <th>Room</th>
                     <th>Day</th>
                     <th>Time</th>
                 </tr>
             </thead>
-            <tbody>
+            <tbody id="scheduleTable">
                 <?php while ($row = $result->fetch_assoc()): ?>
                     <tr>
                         <td><?php echo $row['course_name']; ?></td>
+                        <td><?php echo $row['semester_number']; ?></td>
+                        <td><?php echo $row['class_label']; ?></td>
                         <td><?php echo $row['lecturer_name']; ?></td>
                         <td><?php echo $row['room_name']; ?></td>
                         <td><?php echo $row['day']; ?></td>
@@ -234,7 +317,98 @@ $result = $conn->query("SELECT s.*, c.name as course_name, l.name as lecturer_na
             </tbody>
         </table>
     </div>
+    <div class="modal fade" id="loadingModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-body">
+                    <div class="spinner-border text-primary" role="status"></div>
+                    <h5>Generating Schedule...</h5>
+                    <p>Generation: <span id="generationCounter">0</span>/200</p>
+                    <button id="cancelGeneration" class="btn btn-danger mt-2">Cancel</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            let generationInterval;
+            let xhr; // Store AJAX request
+
+            function startGenerationCounter() {
+                let generation = 0;
+                $('#generationCounter').text(generation);
+                generationInterval = setInterval(() => {
+                    generation++;
+                    if (generation <= 200) {
+                        $('#generationCounter').text(generation);
+                    } else {
+                        clearInterval(generationInterval);
+                    }
+                }, 15); // ~3 seconds for 200 generations
+            }
+
+            function stopGeneration() {
+                clearInterval(generationInterval);
+                if (xhr) {
+                    xhr.abort(); // Cancel AJAX request
+                }
+                $('#loadingModal').modal('hide');
+                $('#alertContainer').html(
+                    '<div class="alert alert-warning">Schedule generation cancelled.</div>'
+                );
+            }
+
+            $('#generateForm').on('submit', function(e) {
+                e.preventDefault();
+                $('#loadingModal').modal({ backdrop: 'static', keyboard: false });
+                $('#loadingModal').modal('show');
+                $('#alertContainer').empty();
+                startGenerationCounter();
+
+                xhr = $.ajax({
+                    url: 'schedule.php',
+                    type: 'POST',
+                    data: $(this).serialize() + '&generate=1',
+                    dataType: 'json',
+                    success: function(response) {
+                        clearInterval(generationInterval);
+                        $('#loadingModal').modal('hide');
+                        $('#alertContainer').html(
+                            `<div class="alert ${response.success ? 'alert-success' : 'alert-danger'}">${response.message}</div>`
+                        );
+                        if (response.success) {
+                            $.ajax({
+                                url: 'schedule.php',
+                                type: 'POST',
+                                data: { semester: $('#semester').val() },
+                                success: function(html) {
+                                    const parser = new DOMParser();
+                                    const doc = parser.parseFromString(html, 'text/html');
+                                    const newTable = $(doc).find('#scheduleTable').html();
+                                    $('#scheduleTable').html(newTable);
+                                }
+                            });
+                        }
+                    },
+                    error: function(jqXHR, textStatus) {
+                        if (textStatus !== 'abort') {
+                            clearInterval(generationInterval);
+                            $('#loadingModal').modal('hide');
+                            $('#alertContainer').html(
+                                '<div class="alert alert-danger">An error occurred while generating the schedule.</div>'
+                            );
+                        }
+                    }
+                });
+            });
+
+            $('#cancelGeneration').on('click', function() {
+                stopGeneration();
+            });
+        });
+    </script>
 </body>
 </html>
 <?php $conn->close(); ?>
