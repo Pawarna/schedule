@@ -29,17 +29,30 @@ class Schedule {
 
 function get_fitness($population, $conn, $semester, $course_class_counts) {
     $conflicts = 0;
-    $room_usage = [];
-    $lecturer_usage = [];
+    $room_usage = []; // Track room usage per time slot
+    $lecturer_usage = []; // Track lecturer usage per time slot
     $capacity_issues = [];
-    foreach ($population as $schedule) {
-        $key = "{$schedule->time_slot_id}-{$schedule->room_id}";
-        $lkey = "{$schedule->time_slot_id}-{$schedule->lecturer_id}";
-        if (isset($room_usage[$key])) $conflicts++;
-        if (isset($lecturer_usage[$lkey])) $conflicts += 2;
-        $room_usage[$key] = true;
-        $lecturer_usage[$lkey] = true;
+    $time_slot_classes = []; // Track number of classes per time slot
 
+    foreach ($population as $schedule) {
+        // Check room conflict: same room, same time slot
+        $room_key = "{$schedule->time_slot_id}-{$schedule->room_id}";
+        if (isset($room_usage[$room_key])) {
+            $conflicts++; // Penalize if same room is used in same time slot
+        }
+        $room_usage[$room_key] = true;
+
+        // Check lecturer conflict: same lecturer, same time slot
+        $lecturer_key = "{$schedule->time_slot_id}-{$schedule->lecturer_id}";
+        if (isset($lecturer_usage[$lecturer_key])) {
+            $conflicts += 2; // Higher penalty for lecturer conflict
+        }
+        $lecturer_usage[$lecturer_key] = true;
+
+        // Track classes per time slot
+        $time_slot_classes[$schedule->time_slot_id] = ($time_slot_classes[$schedule->time_slot_id] ?? 0) + 1;
+
+        // Check room capacity
         $result = $conn->query("SELECT r.capacity, 
                                        CASE c.semester_number 
                                            WHEN 1 THEN p.student_count_sem1 
@@ -58,18 +71,25 @@ function get_fitness($population, $conn, $semester, $course_class_counts) {
             $num_classes = $course_class_counts[$schedule->course_id]['num_classes'];
             $students_per_class = ceil($data['student_count'] / $num_classes);
             if ($students_per_class > $data['capacity']) {
-                $conflicts += 0.5;
+                $conflicts += 0.5; // Penalize capacity issues
                 $capacity_issues[] = "{$data['course_name']} (Class {$schedule->class_label}, ~{$students_per_class} siswa, butuh >{$data['capacity']} kapasitas)";
             }
         }
 
+        // Check if lecturer matches course
         $result = $conn->query("SELECT lecturer_id FROM courses WHERE id = {$schedule->course_id}");
         if ($result && $data = $result->fetch_assoc()) {
             if ($schedule->lecturer_id != $data['lecturer_id']) {
-                $conflicts += 3;
+                $conflicts += 3; // Penalize wrong lecturer
             }
         }
     }
+
+    // Log number of classes per time slot for debugging
+    foreach ($time_slot_classes as $time_slot_id => $count) {
+        error_log("Time slot $time_slot_id: $count classes");
+    }
+
     return [
         'fitness' => $conflicts == 0 ? 1000 : 1000 / (1 + $conflicts),
         'capacity_issues' => $capacity_issues
@@ -149,7 +169,10 @@ function generate_schedule($conn, $semester) {
             $lecturer_load[$course['lecturer_id']] = ($lecturer_load[$course['lecturer_id']] ?? 0) + $num_classes;
         }
     }
-    $available_slots = count($rooms) * count($time_slots);
+
+    // Check if enough rooms for max classes per time slot
+    $max_classes_per_slot = min(count($rooms), $total_classes);
+    $available_slots = count($time_slots) * count($rooms);
     $overloaded_lecturers = [];
     foreach ($lecturer_load as $lecturer_id => $load) {
         if ($load > count($time_slots)) {
@@ -163,7 +186,7 @@ function generate_schedule($conn, $semester) {
             $capacity_issues[] = "{$info['course_name']} ({$info['student_count']} siswa, butuh >$max_room_capacity kapasitas)";
         }
     }
-    if (empty($courses) || empty($rooms) || empty($time_slots) || !empty($overloaded_lecturers) || $available_slots < $total_classes || !empty($capacity_issues)) {
+    if (empty($courses) || empty($rooms) || empty($time_slots) || !empty($overloaded_lecturers) || !empty($capacity_issues)) {
         $message = "Sumber daya tidak cukup: ";
         if (empty($courses)) $message .= "Tidak ada mata kuliah. ";
         if (empty($rooms)) $message .= "Tidak ada ruangan. ";
@@ -484,7 +507,7 @@ $result = $conn->query($query);
                     stopGenerationCounter();
                     $('#loadingModal').modal('hide');
                     $('#alertContainer').html(
-                        `<div class="alert ${response.success ? 'alert-success' : 'alert-danger'}">${response.message} (Generasi: ${response.generation})</div>`
+                        `<div class="alert ${response.success === true ? 'alert-success' : 'alert-danger'}">${response.message} (Generasi: ${response.generation})</div>`
                     );
                     if (response.success) {
                         $.ajax({
